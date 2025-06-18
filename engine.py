@@ -2,42 +2,75 @@ import copy
 import concurrent.futures
 import time
 from board import Board
-from config import ROWS, COLS, BLACK, WHITE, DEPTH
-from functools import lru_cache
+from config import BLACK, WHITE
+
+
+def score_move(engine, board, move):
+    """Heuristic used for move‑ordering."""
+    clone = board.copy()
+    clone.make_move(*move)
+    r, c = move
+
+    # Corners are king
+    if move in [(0, 0), (0, 7), (7, 0), (7, 7)]:
+        return 10_000
+    # Edges next
+    if r in (0, 7) or c in (0, 7):
+        return 3_000 + engine.static_eval(clone)
+    # X‑squares are dangerous in Othello, discourage them a bit
+    if (r, c) in [(1, 1), (1, 6), (6, 1), (6, 6)]:
+        return -1_000
+    return engine.static_eval(clone)
+
 
 class Engine:
-    def __init__(self, color, strength=3):
+    """Othello engine with adjustable strength.
+
+    strength = 1  → piece‑count only
+    strength = 2  → corners / edges / mobility
+    strength = 3  → + stability matrix
+    strength = 4  → + TT move‑ordering hint
+    """
+
+    def __init__(self, color, strength: int = 4, time_limit: float = 0.5):
         self.color = color
-        self.transposition = {}
+        self.strength = max(1, min(strength, 4))
+        self.time_limit = time_limit
+        self.transposition: dict[str, dict] = {}
+        self.node_counter: int = 0
 
-        self.strength = strength
-        # 1(Basic): Just piece count.
-        # 2(Medium): Corners, edges, and mobility.
-        # 3(Strong): Adds stability matrix and dynamic weights.
-
-    def dynamic_weights(self, board):
-        total_pieces = sum(row.count(BLACK) + row.count(WHITE) for row in board.grid)
-        phase = total_pieces / 64
-        mobility_weight = int(10 * (1 - phase)) + 1
-        corner_weight = int(100 * (1 - phase)) + 50
-        edge_weight = int(20 * (1 - phase)) + 5
-        stability_weight = int(40 * phase) + 10
-        return mobility_weight, corner_weight, edge_weight, stability_weight
+    # ---------------------------------------------------------------------
+    # Evaluation helpers
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _dynamic_weights(board):
+        total = sum(cell is not None for row in board.grid for cell in row)
+        phase = total / 64  # 0→opening, 1→endgame
+        return (
+            int(10 * (1 - phase)) + 1,   # mobility
+            int(100 * (1 - phase)) + 50, # corners
+            int(20 * (1 - phase)) + 5,   # edges
+            int(40 * phase) + 10         # stability
+        )
 
     def static_eval(self, board):
+        """Return a heuristic evaluation from the perspective of `self.color`."""
         if self.strength == 1:
             black, white = board.count_pieces()
             return (white - black) if self.color == WHITE else (black - white)
 
-        mobility_weight, corner_weight, edge_weight, stability_weight = self.dynamic_weights(board)
+        mob_w, cor_w, edge_w, stab_w = self._dynamic_weights(board)
 
+        # Corner / edge counts ------------------------------------------------
         corners = [(0, 0), (0, 7), (7, 0), (7, 7)]
-        edges = [(0, c) for c in range(8)] + [(7, c) for c in range(8)] + [(r, 0) for r in range(8)] + [(r, 7) for r in range(8)]
-        my_corners = sum(1 for r, c in corners if board.grid[r][c] == self.color)
-        opp_corners = sum(1 for r, c in corners if board.grid[r][c] not in (self.color, None))
-        my_edges = sum(1 for r, c in edges if board.grid[r][c] == self.color)
-        opp_edges = sum(1 for r, c in edges if board.grid[r][c] not in (self.color, None))
+        edges = [(0, c) for c in range(8)] + [(7, c) for c in range(8)] + \
+                [(r, 0) for r in range(8)] + [(r, 7) for r in range(8)]
+        my_corners = sum(board.grid[r][c] == self.color for r, c in corners)
+        opp_corners = sum(board.grid[r][c] not in (None, self.color) for r, c in corners)
+        my_edges = sum(board.grid[r][c] == self.color for r, c in edges)
+        opp_edges = sum(board.grid[r][c] not in (None, self.color) for r, c in edges)
 
+        # Mobility -----------------------------------------------------------
         current = board.current_player
         board.current_player = self.color
         my_moves = len(board.get_valid_moves())
@@ -45,13 +78,15 @@ class Engine:
         opp_moves = len(board.get_valid_moves())
         board.current_player = current
 
+        # Piece differential -------------------------------------------------
         black, white = board.count_pieces()
         my_pieces = white if self.color == WHITE else black
         opp_pieces = black if self.color == WHITE else white
 
+        # Stability (strength ≥3) -------------------------------------------
         stability_score = 0
         if self.strength >= 3:
-            stability_matrix = [
+            stab = [
                 [4, -3, 2, 2, 2, 2, -3, 4],
                 [-3, -4, -1, -1, -1, -1, -4, -3],
                 [2, -1, 1, 0, 0, 1, -1, 2],
@@ -63,36 +98,51 @@ class Engine:
             ]
             for r in range(8):
                 for c in range(8):
+                    val = stab[r][c]
                     if board.grid[r][c] == self.color:
-                        stability_score += stability_matrix[r][c]
+                        stability_score += val
                     elif board.grid[r][c] not in (None, self.color):
-                        stability_score -= stability_matrix[r][c]
+                        stability_score -= val
 
         return (
-            corner_weight * (my_corners - opp_corners) +
-            edge_weight * (my_edges - opp_edges) +
-            mobility_weight * (my_moves - opp_moves) +
-            (my_pieces - opp_pieces) +
-            (stability_weight * stability_score if self.strength >= 3 else 0)
+            cor_w * (my_corners - opp_corners)
+            + edge_w * (my_edges - opp_edges)
+            + mob_w * (my_moves - opp_moves)
+            + (my_pieces - opp_pieces)
+            + (stab_w * stability_score if self.strength >= 3 else 0)
         )
 
+    # ---------------------------------------------------------------------
+    # Search
+    # ---------------------------------------------------------------------
     def negamax(self, board, depth, alpha, beta, color):
         key = board.board_hash() + str(board.current_player)
-        if key in self.transposition and self.transposition[key]['depth'] >= depth:
-            return self.transposition[key]['score'], self.transposition[key]['move']
+        cache = self.transposition.get(key)
+        if cache and cache['depth'] >= depth:
+            return cache['score'], cache['move']
 
-        valid_moves = board.get_valid_moves()
-        if depth == 0 or not valid_moves:
+        moves = board.get_valid_moves()
+        if depth == 0 or not moves:
             return color * self.static_eval(board), None
 
-        valid_moves.sort(key=lambda m: score_move(self, board, m), reverse=True)
+        # Move ordering ------------------------------------------------------
+        if self.strength == 4:
+            hint = cache['move'] if cache else None
+            if hint in moves:
+                moves.remove(hint)
+                moves = [hint] + sorted(moves, key=lambda m: score_move(self, board, m), reverse=True)
+            else:
+                moves.sort(key=lambda m: score_move(self, board, m), reverse=True)
+        else:
+            moves.sort(key=lambda m: score_move(self, board, m), reverse=True)
 
-        max_score = -float('inf')
         best_move = None
-        for move in valid_moves:
-            clone = board.copy()
-            clone.make_move(*move)
-            score, _ = self.negamax(clone, depth - 1, -beta, -alpha, -color)
+        max_score = -float('inf')
+        for move in moves:
+            self.node_counter += 1
+            child = board.copy()
+            child.make_move(*move)
+            score, _ = self.negamax(child, depth - 1, -beta, -alpha, -color)
             score = -score
             if score > max_score:
                 max_score = score
@@ -104,52 +154,42 @@ class Engine:
         self.transposition[key] = {'score': max_score, 'move': best_move, 'depth': depth}
         return max_score, best_move
 
-    def get_best_move(self, board, time_limit=1.5):
-        valid_moves = board.get_valid_moves()
-        if not valid_moves:
+    # ---------------------------------------------------------------------
+    # Root call with iterative deepening & threading
+    # ---------------------------------------------------------------------
+    def get_best_move(self, board):
+        moves = board.get_valid_moves()
+        if not moves:
             return None
 
-        start_time = time.time()
+        start = time.time()
         best_move = None
-        max_depth = 1
+        depth = 1
+        self.node_counter = 0
 
         while True:
-            if time.time() - start_time > time_limit:
+            if time.time() - start > self.time_limit:
                 break
 
-            current_best = None
-            max_score = -float('inf')
-            alpha, beta = -float('inf'), float('inf')
-            for move in sorted(valid_moves, key=lambda m: score_move(self, board, m), reverse=True):
-                clone = board.copy()
-                clone.make_move(*move)
-                score, _ = self.negamax(clone, max_depth - 1, -beta, -alpha, -1)
-                score = -score
-                if score > max_score:
-                    max_score = score
-                    current_best = move
-                alpha = max(alpha, score)
-                if time.time() - start_time > time_limit:
-                    break
+            def eval_move(m):
+                child = board.copy()
+                child.make_move(*m)
+                score, _ = self.negamax(child, depth - 1, -float('inf'), float('inf'), -1)
+                return -score, m
 
-            if time.time() - start_time <= time_limit:
+            best_score = -float('inf')
+            current_best = None
+
+            with concurrent.futures.ThreadPoolExecutor() as ex:
+                for score, m in ex.map(eval_move, moves):
+                    if score > best_score:
+                        best_score, current_best = score, m
+                    if time.time() - start > self.time_limit:
+                        break
+
+            if time.time() - start <= self.time_limit:
                 best_move = current_best
-                max_depth += 1
+                depth += 1
             else:
                 break
-
         return best_move
-
-def score_move(engine, board, move):
-    clone = board.copy()
-    clone.make_move(*move)
-    r, c = move
-
-    # Prioritize strong positions
-    if move in [(0, 0), (0, 7), (7, 0), (7, 7)]:
-        return 10000
-    elif r in (0, 7) or c in (0, 7):
-        return 3000 + engine.static_eval(clone)
-    elif (r in (1, 6) and c in (1, 6)):
-        return -1000  # avoid dangerous x-squares
-    return engine.static_eval(clone)

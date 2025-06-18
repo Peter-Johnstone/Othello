@@ -1,6 +1,8 @@
 import copy
 import threading
 import pygame
+from kiwisolver import strength
+
 from board import Board
 from engine import Engine
 from config import WHITE, WIDTH, MENU_WIDTH
@@ -8,7 +10,7 @@ from config import WHITE, WIDTH, MENU_WIDTH
 class GameManager:
     def __init__(self):
         self.board = Board()
-        self.ai = Engine(WHITE, strength = 2)
+        self.ai = Engine(WHITE)
         self.selected_move = None
         self.hint_active = False
         self.game_over = False
