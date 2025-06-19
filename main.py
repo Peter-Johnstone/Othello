@@ -16,12 +16,14 @@ def main():
     clock = pygame.time.Clock()
     gm = GameManager()
     running = True
+    hint_engine = Engine(gm.board.current_player, strength=4, time_limit=1.5)
 
     while running:
+        # 1. handle passes
         if not gm.board.get_valid_moves():
             gm.board.current_player = WHITE if gm.board.current_player == BLACK else BLACK
             if gm.board.current_player == WHITE:
-                gm.run_ai()
+                gm.start_ai()  # ✅ use start_ai(), *not* run_ai()
             if not gm.board.get_valid_moves():
                 gm.game_over = True
         draw_ui(WIN, gm)
@@ -44,8 +46,8 @@ def main():
                 elif gm.move_button_rect.collidepoint(x, y):
                     if gm.selected_move:
                         gm.play_move(*gm.selected_move)
+                        gm.ai.evaluating = False
                 elif gm.hint_button_rect.collidepoint(x, y):
-                    hint_engine = Engine(gm.board.current_player, strength=4, time_limit=1.5)
                     hint = hint_engine.get_best_move(gm.board)
 
                     if hint:
